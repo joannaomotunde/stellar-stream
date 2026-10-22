@@ -299,9 +299,11 @@ function getFallbackPollInterval(): number {
  * Because event writes and the checkpoint write are separate operations
  * (events are committed page-by-page; the checkpoint is saved after the
  * poll completes), a crash between them can leave events persisted ahead
- * of the checkpoint.  That is safe: the dedup index on
+ * of the checkpoint. That is safe: the dedup index on
  * stream_events(stream_id, event_type, ledger_sequence) makes reprocessing
- * idempotent, and the next poll simply re-reads from the stale checkpoint.
+ * idempotent, and the next poll re-reads from the stale checkpoint. Event
+ * decoding or storage errors must escape the page transaction so it rolls
+ * back and the checkpoint remains unchanged.
  *
  * Callers must not report a poll as successful unless the checkpoint
  * reflects the events actually committed.  `saveCheckpoint` is only
@@ -590,13 +592,18 @@ async function indexEventsWithFallback(db: any, currentLedger: number, currentPo
         const changesAfter = db.prepare("SELECT changes() AS n").get() as { n: number } | undefined;
         if ((changesAfter?.n ?? 1) === 0) {
           dedupedCount++;
-          indexerEventsDedupedTotal.inc();
         } else {
           insertedCount++;
-          eventsIndexedTotal.inc();
         }
       }
     })();
+  }
+
+  for (let i = 0; i < insertedCount; i++) {
+    eventsIndexedTotal.inc();
+  }
+  for (let i = 0; i < dedupedCount; i++) {
+    indexerEventsDedupedTotal.inc();
   }
 
   saveCheckpoint(db, currentLedger);
@@ -704,10 +711,8 @@ async function indexEventsWithCursorPagination(db: any, currentLedger: number, c
         const changes = db.prepare("SELECT changes() AS n").get() as { n: number } | undefined;
         if ((changes?.n ?? 1) === 0) {
           pageDeduped++;
-          indexerEventsDedupedTotal.inc();
         } else {
           pageInserted++;
-          eventsIndexedTotal.inc();
         }
 
         if (event.ledger > maxLedgerSeen) {
@@ -715,6 +720,13 @@ async function indexEventsWithCursorPagination(db: any, currentLedger: number, c
         }
       }
     })();
+
+    for (let i = 0; i < pageInserted; i++) {
+      eventsIndexedTotal.inc();
+    }
+    for (let i = 0; i < pageDeduped; i++) {
+      indexerEventsDedupedTotal.inc();
+    }
 
     totalInserted += pageInserted;
     totalDeduped += pageDeduped;
@@ -908,5 +920,6 @@ function processEvent(db: any, event: rpc.Api.EventResponse): void {
     }
   } catch (err) {
     logger.error({ err }, "failed to process event");
+    throw err;
   }
 }
